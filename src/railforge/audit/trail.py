@@ -18,6 +18,10 @@ class Trail:
     def __init__(self):
         self._rows = []
 
+    @property
+    def records(self):
+        return tuple(self._rows)
+
     @staticmethod
     def _digest(index, actor, action, subject, at, previous):
         b = json.dumps({'index': index, 'actor': actor, 'action': action, 'subject': subject, 'at': at.astimezone(timezone.utc).isoformat(), 'previous': previous}, sort_keys=True, separators=(',', ':')).encode()

@@ -9,6 +9,7 @@ from railforge.crew.relief_points import choose as choose_relief
 from railforge.eta.event_fusion import fused_delay
 from railforge.inventory.wagon_pool import allocate
 from railforge.intermodal.connections import choose as choose_connection
+from railforge.intermodal.handoff import HandoffRequest
 from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
 from railforge.planning.loco_circulation import circulate
@@ -72,6 +73,29 @@ class RailForgeFeatureService:
             selected = allocate(wagons, wagon_type, location, on, count, required_days, forbidden)
             return {"move": move, "wagons": selected}
         return self.control.run(operation_id, "feature.intermodal.chain", operation_id, at, action)
+
+    def arrange_handoff(self, operation_id, request_id, inbound, outbound, unload,
+                        load, cutoff_before, chassis_quantity, chassis_pool_rows,
+                        at, chassis_on=None):
+        """Rail-to-road handoff as one replayable, idempotent workflow.
+
+        Arrival anchors the window (not gate/entry time); unload and load must
+        complete before the road cutoff, and only then is the chassis pool
+        reservation published.
+        """
+        request = HandoffRequest(
+            request_id=request_id,
+            inbound=inbound,
+            outbound=outbound,
+            unload=unload,
+            load=load,
+            cutoff_before=cutoff_before,
+            chassis_quantity=chassis_quantity,
+            chassis_on=chassis_on,
+        )
+        return self.control.arrange_intermodal_handoff(
+            operation_id, request, at, initial_pool=chassis_pool_rows
+        )
 
     def approve_possession(self, operation_id, candidate, rows, occupancies, occupancy, clearance, at):
         def action():

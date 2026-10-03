@@ -38,3 +38,11 @@ class RailForgeService:
     def workflow(self):
         return self.control
 
+    def arrange_handoff(self, operation_id, request, at, initial_pool=None):
+        return self.control.arrange_intermodal_handoff(
+            operation_id, request, at, initial_pool=initial_pool
+        )
+
+    def replay_handoffs(self):
+        return self.control.replay_handoffs()
+
