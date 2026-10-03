@@ -8,7 +8,11 @@ from railforge.crew.duty import legal as duty_legal
 from railforge.crew.relief_points import choose as choose_relief
 from railforge.eta.event_fusion import fused_delay
 from railforge.inventory.wagon_pool import allocate
-from railforge.intermodal.connections import choose as choose_connection
+from railforge.intermodal.booking_workflow import (
+    INTERMODAL_CHAIN_TOPIC,
+    book_chain,
+    request_fingerprint,
+)
 from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
 from railforge.planning.loco_circulation import circulate
@@ -65,13 +69,32 @@ class RailForgeFeatureService:
 
     def book_intermodal_chain(self, operation_id, inbound, candidates, unload, load, cutoff,
                               wagons, wagon_type, location, on, count, required_days, forbidden, at):
+        request = {
+            "inbound": inbound,
+            "candidates": tuple(sorted(candidates, key=lambda move: move.id)),
+            "unload": unload,
+            "load": load,
+            "cutoff": cutoff,
+            "wagons": tuple(sorted(wagons, key=lambda wagon: wagon.id)),
+            "wagon_type": wagon_type,
+            "location": location,
+            "on": on,
+            "count": count,
+            "required_days": required_days,
+            "forbidden": frozenset(forbidden),
+        }
+
         def action():
-            move = choose_connection(inbound, candidates, unload, load, cutoff)
-            if move is None:
-                raise ValueError("no intermodal connection")
-            selected = allocate(wagons, wagon_type, location, on, count, required_days, forbidden)
-            return {"move": move, "wagons": selected}
-        return self.control.run(operation_id, "feature.intermodal.chain", operation_id, at, action)
+            return book_chain(
+                inbound, candidates, unload, load, cutoff,
+                wagons, wagon_type, location, on, count, required_days, forbidden,
+                self.control.stream,
+            )
+
+        return self.control.run(
+            operation_id, INTERMODAL_CHAIN_TOPIC, operation_id, at, action,
+            {"request_hash": request_fingerprint(request)},
+        )
 
     def approve_possession(self, operation_id, candidate, rows, occupancies, occupancy, clearance, at):
         def action():

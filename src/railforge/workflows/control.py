@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, asdict
 from datetime import datetime, timezone
 from decimal import Decimal
+from threading import RLock
 from typing import Any, Callable, Mapping, TypeVar
 
 from railforge.audit.trail import Trail
@@ -30,7 +31,6 @@ from railforge.yard.switching import lock_route
 from railforge.crew.duty import legal as duty_legal
 
 T = TypeVar("T")
-BROKEN_CONTROL_TOPICS: set[str] = set()
 
 
 def _safe(value: Any) -> Any:
@@ -68,33 +68,77 @@ class RailForgeWorkflowControl:
         self.store = store or VersionedStore()
         self._receipts: dict[str, OperationReceipt] = {}
         self._consumers: dict[str, CursorConsumer] = {}
+        self._lock = RLock()
 
     @property
     def receipts(self) -> Mapping[str, OperationReceipt]:
         return dict(self._receipts)
 
+    @staticmethod
+    def _same_evidence(previous: Mapping[str, Any], evidence: Mapping[str, Any] | None) -> bool:
+        requested = dict(evidence or {})
+        if not requested:
+            return True
+        return all(previous.get(key) == value for key, value in requested.items())
+
+    @staticmethod
+    def _replay_event(event) -> OperationReceipt:
+        payload = event.payload
+        return OperationReceipt(
+            operation_id=event.event_id,
+            topic=event.topic,
+            subject=event.subject,
+            result=payload.get("result"),
+            event=event,
+            audit_index=int(payload.get("audit_index", 0)),
+            version=int(payload.get("version", 0)),
+        )
+
+    def replay(self, topics: set[str] | None = None) -> Mapping[str, OperationReceipt]:
+        """Rebuild operation receipts from the hash-chained event stream."""
+        with self._lock:
+            receipts = {}
+            for event in self.stream.snapshot():
+                if topics is not None and event.topic not in topics:
+                    continue
+                receipt = self._replay_event(event)
+                receipts[receipt.operation_id] = receipt
+            self._receipts.update(receipts)
+            return dict(receipts)
+
     def _commit(self, operation_id: str, topic: str, subject: str, at: datetime,
                 action: Callable[[], T], evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
-        previous = self._receipts.get(operation_id)
-        if previous is not None:
-            if previous.topic != topic or previous.subject != subject:
-                raise ValueError("operation id reused for a different workflow")
-            return previous
-        result = action()
-        version = self.store.write(subject, _safe(result))
-        payload = {
-            "operation_id": operation_id,
-            "status": "committed",
-            "control_path": "legacy" if topic in BROKEN_CONTROL_TOPICS else "atomic",
-            "version": version,
-            "result": _safe(result),
-            **dict(evidence or {}),
-        }
-        event = self.stream.publish(operation_id, at, topic, subject, payload)
-        audit = self.trail.append("railforge-control", topic, subject, at)
-        receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index, version)
-        self._receipts[operation_id] = receipt
-        return receipt
+        with self._lock:
+            previous = self._receipts.get(operation_id)
+            if previous is None:
+                event = self.stream.get(operation_id)
+                if event is not None:
+                    previous = self._replay_event(event)
+                    self._receipts[operation_id] = previous
+            if previous is not None:
+                if previous.topic != topic or previous.subject != subject:
+                    raise ValueError("operation id reused for a different workflow")
+                if not self._same_evidence(previous.event.payload, evidence):
+                    raise ValueError("operation id reused with different request")
+                return previous
+
+            result = action()
+            safe_result = _safe(result)
+            audit = self.trail.append("railforge-control", topic, subject, at)
+            version = self.store.write(subject, safe_result)
+            payload = {
+                "operation_id": operation_id,
+                "status": "committed",
+                "control_path": "atomic",
+                "version": version,
+                "audit_index": audit.index,
+                "result": safe_result,
+                **dict(evidence or {}),
+            }
+            event = self.stream.publish(operation_id, at, topic, subject, payload)
+            receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index, version)
+            self._receipts[operation_id] = receipt
+            return receipt
 
     def run(self, operation_id: str, topic: str, subject: str, at: datetime,
             action: Callable[[], T], evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
@@ -136,8 +180,11 @@ class RailForgeWorkflowControl:
                             lambda: axle_route_ok(wagon, max_axle, max_gross))
 
     def book_intermodal(self, operation_id, inbound, outbound, unload, load, cutoff, subject, at):
-        return self._commit(operation_id, "intermodal.booked", subject, at,
-                            lambda: feasible(inbound, outbound, unload, load, cutoff))
+        def action():
+            if not feasible(inbound, outbound, unload, load, cutoff):
+                raise ValueError("intermodal cutoff missed")
+            return True
+        return self._commit(operation_id, "intermodal.booked", subject, at, action)
 
     def protect_possession(self, operation_id, candidate, rows, subject, at):
         return self._commit(operation_id, "possession.protected", subject, at,
@@ -187,6 +234,3 @@ class RailForgeWorkflowControl:
     def fuse_eta(self, operation_id, rows, max_lateness, subject, at):
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
-
-
-BROKEN_CONTROL_TOPICS.add('intermodal.booked')
